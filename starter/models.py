@@ -1,6 +1,6 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from config import MODEL_NAME
+from .config import MODEL_NAME
 
 def load_tokenizer(name=MODEL_NAME):
     tok = AutoTokenizer.from_pretrained(name)
