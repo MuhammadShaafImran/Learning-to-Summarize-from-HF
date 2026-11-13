@@ -22,9 +22,13 @@ DPO settings from the assignment:
 
 import csv
 import math
+import os
 import time
 from functools import partial
 from pathlib import Path
+
+# Helps the T4 allocator reuse fragmented blocks.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn.functional as F
@@ -35,7 +39,7 @@ from starter.models import load_tokenizer, load_causal_lm
 from starter.data import load_preference_splits
 from starter.batching import collate_pref
 
-from common import set_seed, token_logprobs
+from common import set_seed, summary_logprobs
 
 
 # --------------------------------------------------
@@ -47,6 +51,10 @@ BATCH_SIZE = 8
 LEARNING_RATE = 2e-6
 EPOCHS = 1
 LOG_INTERVAL = 250
+
+# T4-friendly: recompute layer activations during backward instead of storing
+# them all. This does not change the DPO maths.
+USE_GRADIENT_CHECKPOINTING = True
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -68,10 +76,10 @@ def sequence_logprob(model, input_ids, attention_mask, prompt_lens):
     """
     Return log pi(y | x) for every row in the batch.
 
-    Only summary tokens contribute. Prompt tokens and padding are excluded by
-    the summary mask returned by token_logprobs.
+    Only summary tokens contribute. summary_logprobs computes the vocabulary
+    softmax only at those positions, which keeps DPO within T4 memory.
     """
-    log_probs, summary_mask = token_logprobs(
+    row_sums, _token_counts = summary_logprobs(
         model,
         input_ids,
         attention_mask,
@@ -79,7 +87,7 @@ def sequence_logprob(model, input_ids, attention_mask, prompt_lens):
     )
 
     # Shape: (B,)
-    return log_probs.masked_fill(~summary_mask, 0.0).sum(dim=1)
+    return row_sums
 
 
 # --------------------------------------------------
@@ -98,15 +106,8 @@ def dpo_margin(policy, reference, batch, device):
     rejected_mask = batch["rejected_mask"].to(device)
     prompt_lens = batch["prompt_lens"].to(device)
 
-    # Trainable policy: build the graph for backpropagation.
-    policy_chosen = sequence_logprob(
-        policy, chosen_ids, chosen_mask, prompt_lens
-    )
-    policy_rejected = sequence_logprob(
-        policy, rejected_ids, rejected_mask, prompt_lens
-    )
-
-    # Frozen reference: no gradients and no graph.
+    # Frozen reference first: no graph, and its activations are freed before
+    # the trainable policy forwards are kept for backpropagation.
     with torch.no_grad():
         reference_chosen = sequence_logprob(
             reference, chosen_ids, chosen_mask, prompt_lens
@@ -114,6 +115,14 @@ def dpo_margin(policy, reference, batch, device):
         reference_rejected = sequence_logprob(
             reference, rejected_ids, rejected_mask, prompt_lens
         )
+
+    # Trainable policy: build the graph for backpropagation.
+    policy_chosen = sequence_logprob(
+        policy, chosen_ids, chosen_mask, prompt_lens
+    )
+    policy_rejected = sequence_logprob(
+        policy, rejected_ids, rejected_mask, prompt_lens
+    )
 
     chosen_advantage = policy_chosen - reference_chosen
     rejected_advantage = policy_rejected - reference_rejected
@@ -238,9 +247,18 @@ def main():
     print("Optimizer steps:        ", len(train_loader) * EPOCHS)
 
     # Policy and frozen reference, both from the SFT checkpoint.
+    #
+    # load_causal_lm() follows the checkpoint's config, which stores
+    # torch_dtype=bfloat16. Two numerically identical bf16 models still give
+    # slightly different logits (bf16 has ~3 decimal digits), so the DPO margin
+    # is not exactly zero and the log(2) check fails. Upcasting to float32 makes
+    # both copies bit-identical and keeps the check meaningful.
     print("\nLoading SFT policy and frozen reference...")
-    policy = load_causal_lm(name_or_path=SFT_CHECKPOINT, device=DEVICE)
-    reference = load_causal_lm(name_or_path=SFT_CHECKPOINT, device=DEVICE)
+    policy = load_causal_lm(name_or_path=SFT_CHECKPOINT, device=DEVICE).float()
+    reference = load_causal_lm(name_or_path=SFT_CHECKPOINT, device=DEVICE).float()
+
+    print("Policy dtype:   ", next(policy.parameters()).dtype)
+    print("Reference dtype:", next(reference.parameters()).dtype)
 
     reference.eval()
     for parameter in reference.parameters():
@@ -258,6 +276,8 @@ def main():
 
     # Correctness check: at initialisation pi_theta == pi_ref, so the DPO
     # argument is zero and the loss must be log(2) ~= 0.6931.
+    # This runs before gradient checkpointing is switched on so the check uses
+    # the plain forward pass.
     first_batch = next(iter(train_loader))
 
     policy.eval()
@@ -275,6 +295,11 @@ def main():
         "DPO initial-loss check failed: policy and reference must be identical "
         "at the start."
     )
+
+    if USE_GRADIENT_CHECKPOINTING:
+        policy.config.use_cache = False
+        policy.gradient_checkpointing_enable()
+        print("Gradient checkpointing: enabled")
 
     policy.train()
 
@@ -372,6 +397,7 @@ def main():
 
     # Save the DPO policy only (the reference is not needed later).
     print("\nSaving DPO checkpoint...")
+    policy.config.use_cache = True
     policy.save_pretrained(DPO_CHECKPOINT)
     tokenizer.save_pretrained(DPO_CHECKPOINT)
     print("Checkpoint saved at:", DPO_CHECKPOINT)

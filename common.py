@@ -2,6 +2,7 @@ import random
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def set_seed(seed=42):
@@ -66,6 +67,69 @@ def token_logprobs(model, input_ids, attention_mask, prompt_lens):
     del outputs, logits, log_probs_all
 
     return log_probs, summary_mask
+
+
+def summary_logprobs(model, input_ids, attention_mask, prompt_lens):
+    """
+    Return the sum of log P over summary tokens for every row.
+
+    This is the memory-efficient version used by DPO. Instead of computing a
+    full (B, L-1, vocab) log-softmax, it selects the summary positions first
+    and runs cross-entropy only on those positions.
+
+    Args:
+        model:          causal language model.
+        input_ids:      (B, L) right-padded prompt + summary token ids.
+        attention_mask: (B, L) 1 for real tokens, 0 for padding.
+        prompt_lens:    (B,) number of prompt tokens in each row.
+
+    Returns:
+        row_sums:     (B,) sum_t log P(input_ids[b, t] | input_ids[b, :t])
+                      over summary tokens only.
+        token_counts: (B,) number of summary tokens in each row.
+    """
+    targets = input_ids[:, 1:]
+
+    positions = torch.arange(
+        1, targets.size(1) + 1, device=input_ids.device
+    ).unsqueeze(0)
+
+    prompt_lens = torch.as_tensor(prompt_lens, device=input_ids.device)
+    summary_mask = positions >= prompt_lens.unsqueeze(1)
+    summary_mask = summary_mask & attention_mask[:, 1:].bool()
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    )
+
+    # logits[:, j] predicts token j + 1.
+    logits = outputs.logits[:, :-1, :]
+
+    # Select only summary positions before the expensive vocabulary softmax.
+    selected_logits = logits[summary_mask]          # (N_summary, vocab)
+    selected_targets = targets[summary_mask]        # (N_summary,)
+
+    token_log_probs = -F.cross_entropy(
+        selected_logits,
+        selected_targets,
+        reduction="none",
+    )                                               # (N_summary,)
+
+    row_indices = summary_mask.nonzero(as_tuple=True)[0]
+    row_sums = torch.zeros(
+        input_ids.size(0),
+        device=input_ids.device,
+        dtype=token_log_probs.dtype,
+    ).index_add(0, row_indices, token_log_probs)
+
+    token_counts = summary_mask.sum(dim=1)
+
+    # Free the large (B, L-1, vocab) tensors.
+    del outputs, logits, selected_logits
+
+    return row_sums, token_counts
 
 
 @torch.no_grad()
